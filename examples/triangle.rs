@@ -36,19 +36,19 @@ impl Triangle {
 
 fn main() {
     App::new()
+        .add_plugins(DefaultPlugins)
         .insert_resource(Msaa { samples: 4 })
         .insert_resource(ClearColor(Color::rgb(0.9, 0.9, 0.9)))
-        .add_plugins(DefaultPlugins)
         .add_plugin(render::plugin::TriangleRenderPlugin)
-        .add_startup_system(startup)
+        .add_startup_system(setup)
         .add_system(triangle_mesh_system)
         .run();
 }
 
-fn startup(mut commands: Commands) {
+fn setup(mut commands: Commands) {
     commands.spawn_bundle(OrthographicCameraBundle::new_2d());
     commands.spawn_bundle((
-        Triangle::side(100.0).with_rgba([1.0, 0.0, 0.0, 0.9]),
+        Triangle::side(500.0).with_rgba([1.0, 0.0, 0.0, 0.9]),
         Transform::default(),
         GlobalTransform::default(),
         Visibility::default(),
@@ -68,12 +68,16 @@ fn triangle_mesh_system(
             Mesh::ATTRIBUTE_POSITION,
             [triangle.a, triangle.b, triangle.c]
                 .into_iter()
-                .map(|p| [p.y, p.y, 0.0])
+                .map(|p| [p.x, p.y, 0.0])
                 .collect_vec(),
         );
         mesh.set_attribute(
             Mesh::ATTRIBUTE_COLOR,
             std::iter::repeat(triangle.rgba).take(3).collect_vec(),
+        );
+        mesh.set_attribute(
+            Mesh::ATTRIBUTE_UV_0,
+            std::iter::repeat([0.0, 1.0]).take(3).collect_vec(),
         );
         let handle = meshes.add(mesh);
         commands.entity(entity).insert(TriangleMeshHandle(handle));
@@ -90,11 +94,23 @@ pub mod render {
     }
 
     pub mod system {
-        use crate::TriangleMeshHandle;
+        use bevy::{
+            core::FloatOrd,
+            core_pipeline::Transparent2d,
+            prelude::*,
+            render::{
+                render_component::ComponentUniforms,
+                render_phase::{DrawFunctions, RenderPhase},
+                render_resource::{RenderPipelineCache, SpecializedPipelines},
+                renderer::RenderDevice,
+                view::{ExtractedView, ViewUniforms, VisibleEntities},
+            },
+        };
+        use itertools::Itertools;
 
         use super::*;
-        use bevy::prelude::*;
-        use itertools::Itertools;
+        use crate::TriangleMeshHandle;
+        use pipeline::TrianglePipeline;
 
         pub fn extract_triangle_meshes(
             mut commands: Commands,
@@ -109,8 +125,8 @@ pub mod render {
                 .iter()
                 .filter_map(
                     |(entity, triangle_mesh_handle, tform, vis)| match vis.is_visible {
-                        false => None,
                         true => Some((entity, triangle_mesh_handle, tform)),
+                        false => None,
                     },
                 )
                 .map(|(entity, triangle_mesh_handle, tform)| {
@@ -121,6 +137,87 @@ pub mod render {
                 })
                 .collect_vec();
             commands.insert_or_spawn_batch(components);
+        }
+
+        pub fn queue_view_bind_groups(
+            mut commands: Commands,
+            device: Res<RenderDevice>,
+            pipeline: Res<TrianglePipeline>,
+            view_uniforms: Res<ViewUniforms>,
+            views: Query<Entity, With<ExtractedView>>,
+        ) {
+            let view_binding = match view_uniforms.uniforms.binding() {
+                Some(binding) => binding,
+                None => return,
+            };
+            for entity in views.iter() {
+                let view_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: view_binding.clone(),
+                    }],
+                    label: Some("texture view bind group"),
+                    layout: &pipeline.view_layout,
+                });
+
+                commands
+                    .entity(entity)
+                    .insert(draw::ViewBindGroup(view_bind_group));
+            }
+        }
+
+        pub fn queue_mesh_bind_groups(
+            mut commands: Commands,
+            pipeline: Res<TrianglePipeline>,
+            render_device: Res<RenderDevice>,
+            mesh_uniforms: Res<ComponentUniforms<TriangleUniform>>,
+        ) {
+            let binding = match mesh_uniforms.uniforms().binding() {
+                Some(binding) => binding,
+                None => return,
+            };
+            commands.insert_resource(draw::MeshBindGroup(render_device.create_bind_group(
+                &wgpu::BindGroupDescriptor {
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: binding,
+                    }],
+                    label: Some("body_mesh_bind_group"),
+                    layout: &pipeline.mesh_layout,
+                },
+            )));
+        }
+
+        pub fn queue_triangles(
+            mut view_q: Query<(&VisibleEntities, &mut RenderPhase<Transparent2d>)>,
+            draw_functions: Res<DrawFunctions<Transparent2d>>,
+            msaa: Res<Msaa>,
+            mut pipelines: ResMut<SpecializedPipelines<TrianglePipeline>>,
+            mut pipeline_cache: ResMut<RenderPipelineCache>,
+            pipeline: Res<TrianglePipeline>,
+            mesh_q: Query<(Entity, &TriangleUniform)>,
+        ) {
+            let draw_function = draw_functions
+                .read()
+                .get_id::<draw::DrawTriangle>()
+                .unwrap();
+            let key = pipeline::TrianglePipelineKey::from_msaa_samples(msaa.samples);
+            let pipeline_id = pipelines.specialize(&mut pipeline_cache, &pipeline, key);
+            view_q.iter_mut().for_each(|(visible, mut phase)| {
+                for (entity, uniform) in mesh_q.iter() {
+                    if !visible.entities.contains(&entity) {
+                        continue;
+                    }
+                    let mesh_z = uniform.transform.w_axis.z;
+                    phase.add(Transparent2d {
+                        entity,
+                        draw_function,
+                        pipeline: pipeline_id,
+                        sort_key: FloatOrd(mesh_z),
+                        batch_range: None,
+                    });
+                }
+            });
         }
     }
 
@@ -285,13 +382,16 @@ pub mod render {
     }
 
     pub mod plugin {
+        use bevy::core_pipeline::Transparent2d;
         use bevy::prelude::*;
         use bevy::reflect::TypeUuid;
+        use bevy::render::render_component::UniformComponentPlugin;
+        use bevy::render::render_phase::AddRenderCommand;
         use bevy::render::render_resource::SpecializedPipelines;
-        use bevy::render::RenderApp;
+        use bevy::render::{RenderApp, RenderStage};
 
         use super::pipeline::TrianglePipeline;
-        use super::system;
+        use super::*;
 
         pub const SHADER_HANDLE: HandleUntyped =
             HandleUntyped::weak_from_u64(Shader::TYPE_UUID, 0xc648c90f09f1fe7d);
@@ -306,14 +406,119 @@ pub mod render {
                     SHADER_HANDLE,
                     Shader::from_wgsl(include_str!("triangle.wgsl")),
                 );
+                app.add_plugin(UniformComponentPlugin::<TriangleUniform>::default());
                 let render_app = app.get_sub_app_mut(RenderApp).unwrap();
                 render_app
+                    .add_render_command::<Transparent2d, draw::DrawTriangle>()
                     .init_resource::<TrianglePipeline>()
                     .init_resource::<SpecializedPipelines<TrianglePipeline>>()
-                    .add_system(system::extract_triangle_meshes);
+                    .add_system_to_stage(RenderStage::Extract, system::extract_triangle_meshes)
+                    .add_system_to_stage(RenderStage::Queue, system::queue_view_bind_groups)
+                    .add_system_to_stage(RenderStage::Queue, system::queue_mesh_bind_groups)
+                    .add_system_to_stage(RenderStage::Queue, system::queue_triangles);
             }
         }
     }
 
-    pub mod draw {}
+    pub mod draw {
+        use bevy::ecs::system::{lifetimeless::*, SystemParamItem};
+        use bevy::prelude::*;
+        use bevy::render::mesh::GpuBufferInfo;
+        use bevy::render::render_asset::RenderAssets;
+        use bevy::render::render_component::DynamicUniformIndex;
+        use bevy::render::render_phase::{
+            EntityRenderCommand, RenderCommandResult, SetItemPipeline, TrackedRenderPass,
+        };
+        use bevy::render::render_resource::BindGroup;
+        use bevy::render::view::ViewUniformOffset;
+
+        use crate::TriangleMeshHandle;
+
+        use super::TriangleUniform;
+
+        pub type DrawTriangle = (
+            SetItemPipeline,
+            SetViewBindGroup<0>,
+            SetMeshBindGroup<1>,
+            DrawTriangleMesh,
+        );
+
+        #[derive(Clone, Debug, Component)]
+        pub struct ViewBindGroup(pub BindGroup);
+
+        #[derive(Clone, Debug, Component)]
+        pub struct MeshBindGroup(pub BindGroup);
+
+        pub struct SetViewBindGroup<const I: usize>;
+        impl<const I: usize> EntityRenderCommand for SetViewBindGroup<I> {
+            type Param = SQuery<(Read<ViewUniformOffset>, Read<ViewBindGroup>)>;
+            #[inline]
+            fn render<'w>(
+                view: Entity,
+                _item: Entity,
+                view_query: SystemParamItem<'w, '_, Self::Param>,
+                pass: &mut TrackedRenderPass<'w>,
+            ) -> RenderCommandResult {
+                let (view_uniform, view_bind_group) = view_query.get(view).unwrap();
+                pass.set_bind_group(I, &view_bind_group.0, &[view_uniform.offset]);
+
+                RenderCommandResult::Success
+            }
+        }
+
+        pub struct SetMeshBindGroup<const I: usize>;
+        impl<const I: usize> EntityRenderCommand for SetMeshBindGroup<I> {
+            type Param = (
+                SRes<MeshBindGroup>,
+                SQuery<Read<DynamicUniformIndex<TriangleUniform>>>,
+            );
+            #[inline]
+            fn render<'w>(
+                _view: Entity,
+                item: Entity,
+                (mesh_bind_group, mesh_query): SystemParamItem<'w, '_, Self::Param>,
+                pass: &mut TrackedRenderPass<'w>,
+            ) -> RenderCommandResult {
+                let mesh_index = mesh_query.get(item).unwrap();
+                pass.set_bind_group(I, &mesh_bind_group.into_inner().0, &[mesh_index.index()]);
+                RenderCommandResult::Success
+            }
+        }
+
+        pub struct DrawTriangleMesh;
+        impl EntityRenderCommand for DrawTriangleMesh {
+            type Param = (SRes<RenderAssets<Mesh>>, SQuery<Read<TriangleMeshHandle>>);
+            #[inline]
+            fn render<'w>(
+                _view: Entity,
+                item: Entity,
+                (meshes, mesh_query): SystemParamItem<'w, '_, Self::Param>,
+                pass: &mut TrackedRenderPass<'w>,
+            ) -> RenderCommandResult {
+                let mesh_handle = &mesh_query.get(item).unwrap().0;
+                let gpu_mesh = match meshes.into_inner().get(mesh_handle) {
+                    Some(x) => x,
+                    None => {
+                        error!("couldn't get mesh");
+                        return RenderCommandResult::Failure;
+                    }
+                };
+                pass.set_vertex_buffer(0, gpu_mesh.vertex_buffer.slice(..));
+                match &gpu_mesh.buffer_info {
+                    GpuBufferInfo::Indexed {
+                        buffer,
+                        index_format,
+                        count,
+                    } => {
+                        pass.set_index_buffer(buffer.slice(..), 0, *index_format);
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                    GpuBufferInfo::NonIndexed { vertex_count } => {
+                        pass.draw(0..*vertex_count, 0..1);
+                    }
+                }
+                RenderCommandResult::Success
+            }
+        }
+    }
 }

@@ -75,10 +75,6 @@ fn triangle_mesh_system(
             Mesh::ATTRIBUTE_COLOR,
             std::iter::repeat(triangle.rgba).take(3).collect_vec(),
         );
-        mesh.set_attribute(
-            Mesh::ATTRIBUTE_UV_0,
-            std::iter::repeat([0.0, 1.0]).take(3).collect_vec(),
-        );
         let handle = meshes.add(mesh);
         commands.entity(entity).insert(TriangleMeshHandle(handle));
     }
@@ -330,12 +326,6 @@ pub mod render {
                         format: wgpu::VertexFormat::Float32x4,
                         offset: 0,
                         shader_location: 1,
-                    },
-                    // uv
-                    wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x2,
-                        offset: 12 + 16,
-                        shader_location: 2,
                     },
                 ];
                 RenderPipelineDescriptor {
